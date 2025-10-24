@@ -33,15 +33,13 @@ func NewEventHandler(db *pgxpool.Pool, client *ethclient.Client) *EventHandler {
 }
 
 func (h *EventHandler) CreateEvent(c *gin.Context) {
-	// Updated request structure to handle full event creation
+	// Updated request structure to handle event metadata creation only
+	// on-chain data should be handled by the indexer
 	var req struct {
 		EventID         int64  `json:"event_id" binding:"required"`
 		Title           string `json:"title" binding:"required"`
 		Description     string `json:"description"`
-		Location        string `json:"location"`
 		ImageURL        string `json:"image_url"`
-		IsPublic        bool   `json:"is_public"`
-		RequireApproval bool   `json:"require_approval"`
 		OrganizerAddress string `json:"organizer_address"`
 	}
 
@@ -50,30 +48,19 @@ func (h *EventHandler) CreateEvent(c *gin.Context) {
 		return
 	}
 
-	log.Printf("Creating complete event for EventID: %d, Title: %s, Organizer: %s", req.EventID, req.Title, req.OrganizerAddress)
+	log.Printf("Creating event metadata for EventID: %d, Title: %s, Organizer: %s", req.EventID, req.Title, req.OrganizerAddress)
 
-	// First, insert on-chain event data if not exists (from smart contract)
-	// This would normally be handled by an indexer, but we'll insert it manually for now
-	onchainQuery := `
-		INSERT INTO events_onchain (event_id, vault_address, organizer_address, stake_amount, max_participant, registration_deadline, event_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (event_id) DO NOTHING
-	`
-
-	// For now, we'll use placeholder values since the indexer should handle this
-	// In production, the vault address would come from the smart contract event
-	_, err := h.db.Exec(c, onchainQuery,
-		req.EventID,
-		"0x0000000000000000000000000000000000000000", // Placeholder vault address
-		req.OrganizerAddress,
-		"0", // Placeholder stake amount
-		0,   // Placeholder max participants
-		0,   // Placeholder registration deadline
-		0,   // Placeholder event date
-	)
-
+	// Verify that on-chain data exists in events_onchain table (should be inserted by indexer)
+	var onchainExists bool
+	err := h.db.QueryRow(c, "SELECT EXISTS(SELECT 1 FROM events_onchain WHERE event_id = $1)", req.EventID + 1).Scan(&onchainExists)
 	if err != nil {
-		log.Printf("Warning: Failed to insert on-chain data (may already exist): %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify on-chain event data", "details": err.Error()})
+		return
+	}
+
+	if !onchainExists {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "On-chain event data not found. Make sure the smart contract transaction is confirmed and indexed.", "event_id": req.EventID})
+		return
 	}
 
 	// Insert event metadata into database
@@ -90,7 +77,7 @@ func (h *EventHandler) CreateEvent(c *gin.Context) {
 
 	var metadata models.EventMetadata
 	err = h.db.QueryRow(c, metadataQuery,
-		req.EventID,
+		req.EventID + 1,
 		req.Title,
 		req.Description,
 		req.ImageURL,
@@ -107,29 +94,6 @@ func (h *EventHandler) CreateEvent(c *gin.Context) {
 		log.Printf("Failed to create event metadata: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create event metadata", "details": err.Error()})
 		return
-	}
-
-	// Insert additional event details if we have a location or other fields
-	if req.Location != "" {
-		detailsQuery := `
-			INSERT INTO event_details (event_id, location, is_public, require_approval)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (event_id) DO UPDATE SET
-				location = EXCLUDED.location,
-				is_public = EXCLUDED.is_public,
-				require_approval = EXCLUDED.require_approval
-		`
-
-		_, err = h.db.Exec(c, detailsQuery,
-			req.EventID,
-			req.Location,
-			req.IsPublic,
-			req.RequireApproval,
-		)
-
-		if err != nil {
-			log.Printf("Warning: Failed to insert event details: %v", err)
-		}
 	}
 
 	// Return complete event detail including on-chain data
@@ -294,9 +258,11 @@ func (h *EventHandler) GetEvents(c *gin.Context) {
 	}
 
 	var total int
+	log.Printf("Executing count query: %s with args: %v", countQuery, countArgs)
 	err = h.db.QueryRow(c, countQuery, countArgs...).Scan(&total)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get total count"})
+		log.Printf("Failed to get total count - Query: %s, Args: %v, Error: %v", countQuery, countArgs, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get total count", "details": err.Error()})
 		return
 	}
 
@@ -363,7 +329,7 @@ func (h *EventHandler) GetEvent(c *gin.Context) {
 	event.ImageURL = imageURL
 	event.OrganizerName = "" // Default empty organizer name
 
-	// Get participant count from smart contract
+	// Get participant count from smart contractFailed to get total count
 	if event.VaultAddress != "" {
 		if participantCount, err := h.getParticipantCountFromContract(event.VaultAddress); err == nil {
 			// Add participant count to response
@@ -383,29 +349,15 @@ func (h *EventHandler) GetEvent(c *gin.Context) {
 func (h *EventHandler) SettleEvent(c *gin.Context) {
 	eventID := c.Param("id")
 
-	var req struct {
-		AttendedParticipants []string `json:"attended_participants" binding:"required"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Get event details
-	var event models.Event
+	// Check if event exists and get current status
+	var status string
 	query := `
-		SELECT vault_address, organizer_address, status
-		FROM events
-		WHERE id = $1
+		SELECT status
+		FROM events_metadata
+		WHERE event_id = $1
 	`
 
-	err := h.db.QueryRow(c, query, eventID).Scan(
-		&event.VaultAddress,
-		&event.OrganizerAddress,
-		&event.Status,
-	)
-
+	err := h.db.QueryRow(c, query, eventID).Scan(&status)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Event not found"})
@@ -415,22 +367,16 @@ func (h *EventHandler) SettleEvent(c *gin.Context) {
 		return
 	}
 
-	if event.Status != "active" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Event is not active"})
+	if status != "LIVE" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Event is not live"})
 		return
 	}
 
-	// TODO: Call smart contract to settle event
-	// This would involve:
-	// 1. Connecting to the vault contract
-	// 2. Calling settleEvent with attended participants
-	// 3. Updating the event status in database
-
 	// Update event status
 	updateQuery := `
-		UPDATE events
-		SET status = 'settled', updated_at = $1
-		WHERE id = $2
+		UPDATE events_metadata
+		SET status = 'SETTLED', updated_at = $1
+		WHERE event_id = $2
 	`
 
 	_, err = h.db.Exec(c, updateQuery, time.Now(), eventID)
@@ -442,11 +388,13 @@ func (h *EventHandler) SettleEvent(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Event settled successfully"})
 }
 
-func (h *EventHandler) RegisterUser(c *gin.Context) {
+// ConfirmSettlement handles confirmation from frontend after successful blockchain settlement
+func (h *EventHandler) ConfirmSettlement(c *gin.Context) {
 	eventID := c.Param("id")
 
 	var req struct {
-		UserAddress string `json:"userAddress" binding:"required"`
+		TransactionHash string        `json:"transaction_hash" binding:"required"`
+		AttendedParticipants []string `json:"attended_participants" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -454,77 +402,128 @@ func (h *EventHandler) RegisterUser(c *gin.Context) {
 		return
 	}
 
-	// Get event details
-	var event models.Event
-	query := `
-		SELECT vault_address, registration_deadline, event_date, status
-		FROM events
-		WHERE id = $1
+	log.Printf("Confirming settlement for event %s: tx=%s, participants=%d",
+		eventID, req.TransactionHash, len(req.AttendedParticipants))
+
+	// Update event status to SETTLED in events_metadata table
+	updateQuery := `
+		UPDATE events_metadata
+		SET status = 'SETTLED', updated_at = $1
+		WHERE event_id = $2
 	`
 
-	err := h.db.QueryRow(c, query, eventID).Scan(
-		&event.VaultAddress,
-		&event.RegistrationDeadline,
-		&event.EventDate,
-		&event.Status,
-	)
-
+	_, err := h.db.Exec(c, updateQuery, time.Now(), eventID)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Event not found"})
+		log.Printf("Database error updating event %s: %v", eventID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update event status", "details": err.Error()})
+		return
+	}
+
+	log.Printf("Successfully updated event %s status to SETTLED", eventID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Event settlement confirmed successfully",
+		"transaction_hash": req.TransactionHash,
+	})
+}
+
+func (h *EventHandler) RegisterUser(c *gin.Context) {
+	var req struct {
+		EventID        int64  `json:"event_id" binding:"required"`
+		UserAddress    string `json:"user_address" binding:"required"`
+		TransactionHash string `json:"transaction_hash" binding:"required"`
+		DepositAmount  string `json:"deposit_amount" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("Registering user for event %d: address=%s, tx=%s, amount=%s",
+		req.EventID, req.UserAddress, req.TransactionHash, req.DepositAmount)
+
+	// Get user ID from profiles table using wallet address
+	var userID *string
+	err := h.db.QueryRow(c, "SELECT id FROM profiles WHERE wallet_address = $1", req.UserAddress).Scan(&userID)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("Error querying user profile: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error when checking user profile"})
+		return
+	}
+
+	// If user doesn't exist in profiles, create a basic profile
+	if userID == nil {
+		userID = new(string)
+		insertProfileQuery := `
+			INSERT INTO profiles (wallet_address, created_at, updated_at)
+			VALUES ($1, $2, $3)
+			RETURNING id
+		`
+		err = h.db.QueryRow(c, insertProfileQuery, req.UserAddress, time.Now(), time.Now()).Scan(userID)
+		if err != nil {
+			log.Printf("Error creating user profile: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user profile"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-		return
+		log.Printf("Created new profile for user %s with ID %s", req.UserAddress, *userID)
 	}
 
-	// Check if registration is still open
-	if time.Now().After(event.RegistrationDeadline) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Registration deadline has passed"})
-		return
-	}
-
-	// Check if already registered
-	var existingRegistration int
-	err = h.db.QueryRow(c, "SELECT COUNT(*) FROM checkins WHERE event_id = $1 AND user_address = $2", eventID, req.UserAddress).Scan(&existingRegistration)
+	// Check if participant already exists
+	var existingParticipant int
+	err = h.db.QueryRow(c, "SELECT COUNT(*) FROM participant WHERE event_id = $1 AND user_id = $2", req.EventID, *userID).Scan(&existingParticipant)
 	if err != nil {
+		log.Printf("Error checking existing participant: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
 	}
 
-	if existingRegistration > 0 {
+	if existingParticipant > 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "Already registered for this event"})
 		return
 	}
 
-	// Create registration
+	// Create participant record
 	insertQuery := `
-		INSERT INTO checkins (event_id, user_address, qr_data)
-		VALUES ($1, $2, $3)
-		RETURNING id, qr_data
+		INSERT INTO participant (event_id, user_id, is_attend, is_claim, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, event_id, user_id, is_attend, is_claim, created_at, updated_at
 	`
 
-	var registration struct {
-		ID    string `json:"id"`
-		QRData string `json:"qr_data"`
+	var participant struct {
+		ID        string    `json:"id"`
+		EventID   int64     `json:"event_id"`
+		UserID    string    `json:"user_id"`
+		IsAttend  bool      `json:"is_attend"`
+		IsClaim   bool      `json:"is_claim"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
 	}
 
-	qrData := fmt.Sprintf(`{"eventId":"%s","userAddress":"%s","timestamp":%d}`, eventID, req.UserAddress, time.Now().Unix())
-
-	err = h.db.QueryRow(c, insertQuery, eventID, req.UserAddress, qrData).Scan(
-		&registration.ID,
-		&registration.QRData,
+	now := time.Now()
+	err = h.db.QueryRow(c, insertQuery, req.EventID, *userID, false, false, now, now).Scan(
+		&participant.ID,
+		&participant.EventID,
+		&participant.UserID,
+		&participant.IsAttend,
+		&participant.IsClaim,
+		&participant.CreatedAt,
+		&participant.UpdatedAt,
 	)
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create registration"})
+		log.Printf("Error creating participant record: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register participant"})
 		return
 	}
 
+	// Log the transaction for record keeping
+	log.Printf("Participant registered: event=%d, user=%s, tx=%s", req.EventID, req.UserAddress, req.TransactionHash)
+
 	c.JSON(http.StatusCreated, gin.H{
-		"registration_id": registration.ID,
-		"qr_data": registration.QRData,
+		"success": true,
 		"message": "Successfully registered for event",
+		"participant": participant,
 	})
 }
 
@@ -666,7 +665,7 @@ func (h *EventHandler) GetAttendedParticipants(c *gin.Context) {
 	eventID := c.Param("id")
 
 	query := `
-		SELECT p.wallet_address
+		SELECT pr.wallet_address
 		FROM participant p
 		JOIN profiles pr ON p.user_id = pr.id
 		WHERE p.event_id = $1 AND p.is_attend = true

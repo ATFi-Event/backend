@@ -58,6 +58,7 @@ func (h *UserHandler) CreateProfile(c *gin.Context) {
 		VALUES ($1, $2, $3, $4)
 		RETURNING id, wallet_address, name, email
 	`
+	log.Printf("GetProfile called for wallet address: %s", req.Email)
 
 	var profile models.Profile
 	err = h.db.QueryRow(c, query,
@@ -84,6 +85,7 @@ func (h *UserHandler) CreateProfile(c *gin.Context) {
 
 func (h *UserHandler) GetProfile(c *gin.Context) {
 	walletAddress := c.Param("walletAddress")
+	log.Printf("GetProfile called for wallet address: %s", walletAddress)
 
 	var profile models.Profile
 	query := `
@@ -101,10 +103,12 @@ func (h *UserHandler) GetProfile(c *gin.Context) {
 
 	if err != nil {
 		if err == sql.ErrNoRows {
+			log.Printf("Profile not found for wallet: %s", walletAddress)
 			c.JSON(http.StatusNotFound, gin.H{"error": "Profile not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		log.Printf("Database error getting profile for %s: %v", walletAddress, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "details": err.Error()})
 		return
 	}
 
@@ -118,7 +122,16 @@ func (h *UserHandler) GetProfile(c *gin.Context) {
 	}
 	profile.Balance = balance
 
-	c.JSON(http.StatusOK, profile)
+	// Convert nullable fields to strings for JSON response
+	response := map[string]interface{}{
+		"id":            profile.ID,
+		"wallet_address": profile.WalletAddress,
+		"name":          profile.Name,
+		"email":         profile.Email,
+		"balance":       profile.Balance,
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *UserHandler) UpdateProfile(c *gin.Context) {
@@ -143,10 +156,11 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 		return
 	}
 
-	// Update profile - note: email is not updatable as per user request
+	// Update profile - allow updating both name and email
 	query := `
 		UPDATE profiles
-		SET name = COALESCE($2, name)
+		SET name = COALESCE($2, name),
+		    email = COALESCE($3, email)
 		WHERE wallet_address = $1
 		RETURNING id, wallet_address, name, email
 	`
@@ -155,6 +169,7 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 	err = h.db.QueryRow(c, query,
 		walletAddress,
 		nullIfEmpty(req.Name),
+		nullIfEmpty(req.Email),
 	).Scan(
 		&profile.ID,
 		&profile.WalletAddress,
@@ -189,10 +204,11 @@ func (h *UserHandler) UpsertProfile(c *gin.Context) {
 	}
 
 	if exists {
-		// Update existing profile - note: email is not updatable
+		// Update existing profile - allow updating both name and email
 		query := `
 			UPDATE profiles
-			SET name = COALESCE($2, name)
+			SET name = COALESCE($2, name),
+			    email = COALESCE($3, email)
 			WHERE wallet_address = $1
 			RETURNING id, wallet_address, name, email
 		`
@@ -201,6 +217,7 @@ func (h *UserHandler) UpsertProfile(c *gin.Context) {
 		err = h.db.QueryRow(c, query,
 			req.WalletAddress,
 			nullIfEmpty(req.Name),
+			nullIfEmpty(req.Email),
 		).Scan(
 			&profile.ID,
 			&profile.WalletAddress,

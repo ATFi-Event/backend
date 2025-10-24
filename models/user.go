@@ -3,13 +3,12 @@ package models
 import (
 	"time"
 	"github.com/google/uuid"
-	"database/sql"
 )
 
 type Profile struct {
 	ID            uuid.UUID `json:"id" db:"id"`
 	WalletAddress string    `json:"wallet_address" db:"wallet_address"`
-	Name          string    `json:"name" db:"name"`
+	Name          *string   `json:"name" db:"name"`
 	Email         *string   `json:"email" db:"email"`
 	Balance       string    `json:"balance"` // Calculated from smart contract, not stored in DB
 }
@@ -17,11 +16,12 @@ type Profile struct {
 type CreateProfileRequest struct {
 	WalletAddress string `json:"wallet_address" binding:"required"`
 	Name          string `json:"name" binding:"required"`
-	Email         sql.NullString `json:"email"`
+	Email         string `json:"email"`
 }
 
 type UpdateProfileRequest struct {
-	Name string `json:"name"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
 }
 
 // Legacy User struct for backward compatibility

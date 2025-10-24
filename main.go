@@ -17,23 +17,38 @@ import (
 )
 
 func connectToDatabase() (*pgxpool.Pool, error) {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://user:password@localhost/atfi_db?sslmode=disable"
-	}
+    dbURL := os.Getenv("DATABASE_URL")
+    if dbURL == "" {
+        // Fallback for development/testing
+        dbURL = "postgres://user:password@localhost/atfi_db?sslmode=disable"
+    }
 
-	pool, err := pgxpool.New(context.Background(), dbURL)
-	if err != nil {
-		return nil, err
-	}
+    // 1. Parse the connection URL into a config object
+    config, err := pgxpool.ParseConfig(dbURL)
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse DB URL: %w", err)
+    }
 
-	// Test the connection
-	if err := pool.Ping(context.Background()); err != nil {
-		return nil, err
-	}
+    config.ConnConfig.RuntimeParams["prepare_cache_capacity"] = "0"
+    
+    // 3. Create the pool using the modified config
+    pool, err := pgxpool.NewWithConfig(context.Background(), config)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create connection pool: %w", err)
+    }
 
-	log.Println("Successfully connected to the database!")
-	return pool, nil
+    // Test the connection
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    if err := pool.Ping(ctx); err != nil {
+        // Close the pool if the initial ping fails
+        pool.Close()
+        return nil, fmt.Errorf("failed to ping database: %w", err)
+    }
+
+    log.Println("Successfully connected to the database!")
+    return pool, nil
 }
 
 // Added this function to connect to an Ethereum node, required by EventHandler
@@ -66,6 +81,8 @@ func main() {
 	}
 	defer pool.Close()
 
+	
+
     // Ethereum client connection
     ethClient, err := connectToEthereum()
     if err != nil {
@@ -84,7 +101,7 @@ func main() {
 
 	// CORS configuration
 	corsConfig := cors.DefaultConfig()
-	corsConfig.AllowOrigins = []string{"http://localhost:3000", "http://localhost:3001", "http://localhost:3002"}
+	corsConfig.AllowOrigins = []string{"*"} // Allow all origins
 	corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	corsConfig.AllowHeaders = []string{"Origin", "Content-Type", "Authorization"}
 	router.Use(cors.New(corsConfig))
@@ -103,18 +120,26 @@ func main() {
         api.GET("/events", eventHandler.GetEvents)
         api.GET("/events/:id", eventHandler.GetEvent)
         api.PUT("/events/:id/status", eventHandler.UpdateEventStatus)
-        api.POST("/events/:id/settle", eventHandler.SettleEvent)
+        api.PUT("/events/:id/settle", eventHandler.SettleEvent)
+        api.POST("/events/:id/confirm-settlement", eventHandler.ConfirmSettlement)
         api.POST("/events/:id/notify-settlement", eventHandler.NotifySettlement)
         api.GET("/events/:id/attended", eventHandler.GetAttendedParticipants)
         
         // Event registration routes
-        api.POST("/events/:id/register", eventHandler.RegisterUser)
+        api.POST("/events/register", eventHandler.RegisterUser)
         api.GET("/events/:id/registration", eventHandler.GetUserRegistration)
 
 		// Checkin routes
         api.POST("/checkin", checkinHandler.CheckIn)
         api.POST("/checkin/validate", checkinHandler.ValidateCheckIn)
         api.GET("/events/:id/checkins", checkinHandler.GetCheckins)
+
+        // Claim reward route
+        api.POST("/claim", checkinHandler.ClaimReward)
+
+        // Participant status route
+        api.GET("/events/:id/participant/:userAddress", checkinHandler.GetParticipantStatus)
+        api.GET("/events/:id/participants", checkinHandler.GetEventParticipants)
 
 		// Health check route
 		api.GET("/test-db", func(c *gin.Context) {
